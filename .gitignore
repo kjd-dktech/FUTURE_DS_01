@@ -1,0 +1,5 @@
+data/raw/
+model/
+__pycache__/
+__init__.py
+superstoreSAvenv
