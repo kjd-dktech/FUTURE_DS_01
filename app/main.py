@@ -1,7 +1,7 @@
-#====================================================
+# Copyright (c) 2026 Kodjo Jean DEGBEVI. Tous droits réservés.
+#=============================================================
 # Application Streamlit pour l'analyse du Superstore
-# Kodjo Jean DEGBEVI
-#====================================================
+#=============================================================
 
 import streamlit as st
 import pandas as pd
@@ -11,26 +11,68 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
 import sys
+import requests
 from pathlib import Path
-import joblib
 import io
 from datetime import datetime
+from dotenv import load_dotenv
 
+load_dotenv()
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 CURRENT_FILE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = CURRENT_FILE_DIR.parent
 data_path = ROOT_DIR / "data" / "processed" / "superstore_processed.csv"
-model_path = ROOT_DIR / "assets" / "exports" / "profit_predictor.joblib"
 sys.path.append(str(ROOT_DIR))
 
 from src.utils import get_us_state_abbrev
 
 st.set_page_config(page_title="Superstore Analytics", page_icon="📊", layout="wide")
 
-# --- INITIALISATION DE L'HISTORIQUE EN SESSION ---
+# --- HISTORIQUE EN SESSION ---
+history_dir = ROOT_DIR / "data" / "logs"
+os.makedirs(history_dir, exist_ok=True)
+sim_history_file = history_dir / "sim_history.csv"
+batch_history_file = history_dir / "batch_history.csv"
+api_key_file = history_dir / ".api_key"
+
 if 'sim_history' not in st.session_state:
-    st.session_state['sim_history'] = []
+    if sim_history_file.exists():
+        try:
+            st.session_state['sim_history'] = pd.read_csv(sim_history_file).to_dict('records')
+        except:
+            st.session_state['sim_history'] = []
+    else:
+        st.session_state['sim_history'] = []
+
 if 'batch_history' not in st.session_state:
-    st.session_state['batch_history'] = []
+    if batch_history_file.exists():
+        try:
+            st.session_state['batch_history'] = pd.read_csv(batch_history_file).to_dict('records')
+        except:
+            st.session_state['batch_history'] = []
+    else:
+        st.session_state['batch_history'] = []
+
+if 'api_key_val' not in st.session_state:
+    if api_key_file.exists():
+        st.session_state['api_key_val'] = api_key_file.read_text().strip()
+    else:
+        st.session_state['api_key_val'] = ""
+
+def save_api_key():
+    val = st.session_state.get('api_input', '')
+    st.session_state['api_key_val'] = val
+    if val:
+        api_key_file.write_text(val)
+    else:
+        if api_key_file.exists():
+            api_key_file.unlink()
+
+def save_history_to_disk(history_type):
+    if history_type == 'sim':
+        pd.DataFrame(st.session_state['sim_history']).to_csv(sim_history_file, index=False)
+    elif history_type == 'batch':
+        pd.DataFrame(st.session_state['batch_history']).to_csv(batch_history_file, index=False)
 
 def read_data_robust(file_obj, file_name=""):
     if file_name.endswith('.json'):
@@ -49,11 +91,12 @@ def read_data_robust(file_obj, file_name=""):
             continue
     raise ValueError(f"Impossible de décoder le fichier CSV. Encodages tentés: {', '.join(encodings)}")
 
-@st.cache_resource
-def load_model():
-    if model_path.exists():
-        return joblib.load(model_path)
-    return None
+def check_api_status():
+    try:
+        res = requests.get(f"{API_URL}/", timeout=3)
+        return res.status_code == 200 and res.json().get("model_loaded", False)
+    except:
+        return False
 
 @st.cache_data
 def load_data():
@@ -65,9 +108,25 @@ def load_data():
     return df
 
 df = load_data()
-model = load_model()
+api_ready = check_api_status()
 
 # --- SIDEBAR ---
+st.sidebar.header("Configuration API")
+api_key = st.sidebar.text_input(
+    "Clé API", 
+    type="password", 
+    key="api_input", 
+    value=st.session_state['api_key_val'], 
+    on_change=save_api_key,
+    help="Appuyez sur Entrée pour valider. Obtenez-la sur http://127.0.0.1:8000/developer"
+)
+
+if not api_ready:
+    st.sidebar.warning("❌ L'API de prédiction ne semble pas être en ligne.")
+else:
+    st.sidebar.success("✅ Modèle API en Ligne")
+st.sidebar.markdown("---")
+
 st.sidebar.header("Filtres")
 
 selected_years = st.sidebar.multiselect(
@@ -250,7 +309,7 @@ elif selected_tab == tabs_names[3]:
         with col_client:
             fig_seg_client = px.bar(
                 df_segment, x='Segment', y='Profit_par_Client',
-                title="Profit Cumulé / Client (LTV)",
+                title="Profit Cumulé / Client",
                 text_auto='$.0f', color='Segment', color_discrete_sequence=px.colors.qualitative.Set2
             )
             fig_seg_client.update_layout(yaxis_title="Profit / Client ($)", showlegend=False)
@@ -268,15 +327,17 @@ elif selected_tab == tabs_names[3]:
 elif selected_tab == tabs_names[4]:
     st.subheader("Modélisation de la Rentabilité")
     
-    if not model:
-        st.warning("⚠️ Modèle de prédiction introuvable. Veuillez exécuter le notebook 'ml_modeling.ipynb' pour générer le pipeline joblib.")
+    if not api_ready:
+        st.warning("⚠️ L'API de prédiction est introuvable. Assurez-vous que le serveur FastAPI est actif.")
+    elif not api_key:
+        st.info("ℹ️ Veuillez entrer votre clé API dans le menu latéral pour utiliser les fonctionnalités de modélisation.")
     else:
-        col_sim, col_batch = st.columns([1, 1])
-        
-        with col_sim:
+        tab_sim, tab_batch = st.tabs(["🎯 Simulateur What-If", "📂 Traitement par Lot"])
+
+        with tab_sim:
             st.markdown("### 🎯 Simulateur What-If")
             with st.form("whatif_form"):
-                sim_sales = st.number_input("Montant de la vente ($)", min_value=0.0, value=100.0, step=10.0)
+                sim_sales = st.number_input("Montant de la vente ($)", min_value=0.0, value=500.0, step=50.0)
                 sim_discount = st.slider("Taux de remise (%)", min_value=0.0, max_value=0.8, value=0.0, step=0.01)
                 
                 cats_available = df['Sub-Category'].unique() if 'Sub-Category' in df.columns else ['Chairs', 'Phones', 'Storage']
@@ -288,35 +349,73 @@ elif selected_tab == tabs_names[4]:
                 segs_available = df['Segment'].unique() if 'Segment' in df.columns else ['Consumer', 'Corporate', 'Home Office']
                 sim_segment = st.selectbox("Segment Client", segs_available)
                 
-                submit_sim = st.form_submit_button("Calculer le Profit Prédictif")
+                submit_sim = st.form_submit_button("Calculer le Profit Estimé")
                 
-                if submit_sim:
-                    input_df = pd.DataFrame([{
-                        'Sales': sim_sales, 'Discount': sim_discount, 
-                        'Sub-Category': sim_subcat, 'Region': sim_region, 'Segment': sim_segment
-                    }])
-                    pred_log = model.predict(input_df)[0]
-                    pred_profit = np.sign(pred_log) * np.expm1(np.abs(pred_log))
+            if submit_sim:
+                payload = {
+                    'Sales': sim_sales, 'Discount': sim_discount, 
+                    'Sub_Category': sim_subcat, 'Region': sim_region, 'Segment': sim_segment
+                }
+                
+                try:
+                    res = requests.post(f"{API_URL}/predict", json=payload, headers={"X-API-KEY": api_key})
                     
-                    st.metric(label="Profit Estimé", value=f"{pred_profit:,.2f} $", delta=f"{(pred_profit/sim_sales if sim_sales > 0 else 0):.2%}", delta_color="normal")
+                    if res.status_code == 200:
+                        pred_profit = res.json()["predicted_profit"]
+                        marge = pred_profit / sim_sales if sim_sales > 0 else 0
+                        
+                        st.success("✅ **Prédiction Réalisée avec Succès !**")
+                        
+                        res_col1, res_col2 = st.columns(2)
+                        res_col1.metric(label="Profit Net Estimé", value=f"{pred_profit:,.2f} $", delta=f"{marge:.2%} de marge", delta_color="normal")
+                        res_col2.metric(label="Chiffre d'Affaires Simulé", value=f"{sim_sales:,.2f} $", delta=f"Remise: {sim_discount:.0%}", delta_color="inverse")
 
-                    # Ajout à l'historique Unitaire
-                    st.session_state['sim_history'].append({
-                        "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "Sales ($)": sim_sales,
-                        "Discount (%)": sim_discount,
-                        "Sub-Category": sim_subcat,
-                        "Region": sim_region,
-                        "Profit Estimé ($)": round(pred_profit, 2)
-                    })
+                        st.markdown("#### Variation du profit estimé selon la remise")
+                        d_range = np.linspace(0, 0.8, 20)
+                        
+                        batch_payload = {"records": [
+                            {'Sales': sim_sales, 'Discount': float(d), 'Sub_Category': sim_subcat, 'Region': sim_region, 'Segment': sim_segment}
+                            for d in d_range
+                        ]}
+                        
+                        res_batch = requests.post(f"{API_URL}/predict_batch", json=batch_payload, headers={"X-API-KEY": api_key})
+                        
+                        if res_batch.status_code == 200:
+                            sim_df = pd.DataFrame([{
+                                'Sales': sim_sales, 'Discount': d,
+                                'Sub-Category': sim_subcat, 'Region': sim_region, 'Segment': sim_segment
+                            } for d in d_range])
+                            sim_df['Profit Estimé'] = res_batch.json()["predictions"]
+                            fig_sim = px.line(sim_df, x='Discount', y='Profit Estimé', markers=True, labels={'Discount': 'Taux de Remise', 'Profit Estimé': 'Profit Estimé ($)'})
+                            fig_sim.add_hline(y=0, line_dash="dash", line_color="red")
+                            fig_sim.add_vline(x=sim_discount, line_dash="dot", line_color="green", annotation_text="Remise Actuelle")
+                            fig_sim.update_layout(xaxis=dict(tickformat='.0%'))
+                            st.plotly_chart(fig_sim, width='stretch')
+                        else:
+                            st.warning(f"Erreur API pour la variation ({res_batch.status_code}): {res_batch.text}")
 
-        with col_batch:
+                        # Ajout à l'historique Unitaire
+                        st.session_state['sim_history'].append({
+                            "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "Sales ($)": sim_sales,
+                            "Discount (%)": sim_discount,
+                            "Sub-Category": sim_subcat,
+                            "Region": sim_region,
+                            "Profit Estimé ($)": round(pred_profit, 2)
+                        })
+                        save_history_to_disk('sim')
+                    else:
+                        st.error(f"Accès Refusé / Erreur API ({res.status_code}): {res.text}")
+                except Exception as e:
+                    st.error(f"Erreur de communication avec l'API : {e}")
+
+        with tab_batch:
             st.markdown("### 📂 Traitement par Lot (Batch CSV, XLS, JSON)")
             uploaded_file = st.file_uploader("Chargez vos données transactionnelles", type=["csv", "xls", "xlsx", "json"])
             
             if uploaded_file is not None:
                 try:
-                    # Lecture robuste : CSV multiprocess, JSON, ou Excel
+                    # Lecture : CSV multiprocess, JSON, ou Excel
                     batch_df = read_data_robust(uploaded_file, uploaded_file.name)
                         
                     st.success(f"{len(batch_df)} lignes chargées avec succès.")
@@ -324,36 +423,45 @@ elif selected_tab == tabs_names[4]:
                     required_cols = ['Sales', 'Discount', 'Sub-Category', 'Region', 'Segment']
                     if all(c in batch_df.columns for c in required_cols):
                         
-                        preds_log = model.predict(batch_df[required_cols])
-                        batch_df['Predicted_Profit'] = np.sign(preds_log) * np.expm1(np.abs(preds_log))
+                        api_records = batch_df[required_cols].rename(columns={"Sub-Category": "Sub_Category"}).to_dict(orient='records')
                         
-                        st.dataframe(batch_df[['Sub-Category', 'Sales', 'Discount', 'Predicted_Profit']].head())
+                        try:
+                            res_batch_file = requests.post(f"{API_URL}/predict_batch", json={"records": api_records}, headers={"X-API-KEY": api_key})
+                            
+                            if res_batch_file.status_code == 200:
+                                batch_df['Predicted_Profit'] = res_batch_file.json()["predictions"]
+                                
+                                st.dataframe(batch_df[['Sub-Category', 'Sales', 'Discount', 'Predicted_Profit']].head())
 
-                        # Historisation métadonnées
-                        if st.button("Valider et Historiser cet import", key="log_batch"):
-                            st.session_state['batch_history'].append({
-                                "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "Fichier": uploaded_file.name,
-                                "Lignes": len(batch_df),
-                                "Statut": "Succès"
-                            })
-                            st.toast("Batch enregistré dans l'historique.")
+                                # Ajout à l'historique Batch
+                                st.session_state['batch_history'].append({
+                                    "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "Fichier": uploaded_file.name,
+                                    "Lignes": len(batch_df),
+                                    "Statut": "Succès"
+                                })
+                                save_history_to_disk('batch')
 
-                        st.markdown("📥 **Télécharger les résultats**")
-                        
-                        # Export JSON
-                        json_data = batch_df.to_json(orient='records').encode('utf-8')
-                        st.download_button("Télécharger JSON", data=json_data, file_name="predictions_batch.json", mime="application/json")
-                        
-                        # Export CSV
-                        csv_data = batch_df.to_csv(index=False, encoding='utf-8').encode('utf-8')
-                        st.download_button("Télécharger CSV", data=csv_data, file_name="predictions_batch.csv", mime="text/csv")
-                        
-                        # Export Excel
-                        buffer = io.BytesIO()
-                        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                            batch_df.to_excel(writer, index=False, sheet_name='Prédictions')
-                        st.download_button("Télécharger Excel", data=buffer.getvalue(), file_name="predictions_batch.xlsx", mime="application/vnd.ms-excel")
+                                st.markdown("📥 **Télécharger les résultats**")
+                                
+                                # Export JSON
+                                json_data = batch_df.to_json(orient='records').encode('utf-8')
+                                st.download_button("Télécharger JSON", data=json_data, file_name="predictions_batch.json", mime="application/json")
+                                
+                                # Export CSV
+                                csv_data = batch_df.to_csv(index=False, encoding='utf-8').encode('utf-8')
+                                st.download_button("Télécharger CSV", data=csv_data, file_name="predictions_batch.csv", mime="text/csv")
+                                
+                                # Export Excel
+                                buffer = io.BytesIO()
+                                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                                    batch_df.to_excel(writer, index=False, sheet_name='Prédictions')
+                                st.download_button("Télécharger Excel", data=buffer.getvalue(), file_name="predictions_batch.xlsx", mime="application/vnd.ms-excel")
+                            else:
+                                st.error(f"Erreur API ({res_batch_file.status_code}) : {res_batch_file.text}")
+                        except Exception as api_err:
+                            st.error(f"Erreur de communication avec l'API : {api_err}")
+                            
                     else:
                         st.error(f"Le fichier doit impérativement contenir les colonnes : {', '.join(required_cols)}")
                         
@@ -365,17 +473,19 @@ elif selected_tab == tabs_names[5]:
     
     st.markdown("### 📈 Simulations Unitaires")
     if st.session_state['sim_history']:
-        st.dataframe(pd.DataFrame(st.session_state['sim_history']), use_container_width=True)
+        st.dataframe(pd.DataFrame(st.session_state['sim_history']), width='stretch')
     else:
         st.info("Aucune simulation unitaire réalisée dans cette session.")
         
     st.markdown("### 📂 Imports")
     if st.session_state['batch_history']:
-        st.dataframe(pd.DataFrame(st.session_state['batch_history']), use_container_width=True)
+        st.dataframe(pd.DataFrame(st.session_state['batch_history']), width='stretch')
     else:
         st.info("Aucun import par lot validé dans cette session.")
         
     if st.button("🗑️ Vider l'historique"):
         st.session_state['sim_history'] = []
         st.session_state['batch_history'] = []
+        save_history_to_disk('sim')
+        save_history_to_disk('batch')
         st.rerun()

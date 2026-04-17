@@ -18,3 +18,14 @@ joblib
 # --- Dashboarding (UI & Visualisation) ---
 streamlit
 plotly
+xslxwriter
+huggingface_hub
+python-dotenv
+
+# --- API Microservice ---
+fastapi
+uvicorn
+pydantic
+requests
+slowapi
+jinja2

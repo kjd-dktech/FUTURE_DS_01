@@ -1,6 +1,13 @@
-data/raw/
+data/
 model/
 assets/exports/
+logs/
+db/
 __pycache__/
 __init__.py
 superstoreSAvenv
+*.env
+*cache*
+*.log
+*.db
+later.txt

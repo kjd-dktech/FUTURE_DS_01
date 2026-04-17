@@ -1,6 +1,6 @@
+# Copyright (c) 2026 Kodjo Jean DEGBEVI. Tous droits réservés.
 #========================================
 # Utility functions
-# Kodjo Jean DEGBEVI
 #========================================
 
 #========================================
