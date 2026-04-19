@@ -4,6 +4,11 @@
 #========================================================
 
 import os
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import sqlite3
 import secrets
 import contextlib
@@ -15,9 +20,10 @@ from typing import List
 import numpy as np
 import pandas as pd
 import joblib
-from fastapi import FastAPI, HTTPException, Request, Depends, Form
+from fastapi import FastAPI, HTTPException, Request, Depends, Form, Cookie, Response
 from fastapi.responses import HTMLResponse
 from fastapi.security.api_key import APIKeyHeader
+import bcrypt
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from huggingface_hub import hf_hub_download
@@ -30,34 +36,52 @@ from slowapi.errors import RateLimitExceeded
 # CONFIGURATION & CONSTANTES
 # ==========================================
 load_dotenv()
-CURRENT_DIR = Path(__file__).resolve().parent
-ROOT_DIR = CURRENT_DIR.parent
+CURRENT_FILE_DIR = Path(__file__).resolve().parent
+ROOT_DIR = CURRENT_FILE_DIR.parent
 model_path = ROOT_DIR / "assets" / "exports" / "profit_predictor.joblib"
-DB_DIR = CURRENT_DIR / "db"
+
+PERSISTENT_DIR = Path(os.getenv("PERSISTENT_DIR", str(ROOT_DIR / "api")))
+
+DB_DIR = PERSISTENT_DIR / "db"
 DB_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DB_DIR / "api_keys.db"
-LOG_DIR = CURRENT_DIR / "logs"
+
+LOG_DIR = PERSISTENT_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+import hashlib
+import base64
+from cryptography.fernet import Fernet
 
 HF_TOKEN = os.getenv("HF_TOKEN")
 HF_REPO_ID = os.getenv("HF_REPO_ID", "kjd-dktech/superstore-profit-predictor")
 ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "").strip('"').strip("'")
-ENV = os.getenv("ENV", "development").lower()
 
-limiter = Limiter(key_func=get_remote_address)
+_key_hash = hashlib.sha256(ADMIN_SECRET_KEY.encode('utf-8')).digest()
+FERNET_KEY = base64.urlsafe_b64encode(_key_hash)
+admin_cipher = Fernet(FERNET_KEY)
+
+ENV = os.getenv("ENV", "development").lower()
+REDIS_URL = os.getenv("REDIS_URL")
+
+if REDIS_URL:
+    limiter = Limiter(key_func=get_remote_address, storage_uri=REDIS_URL)
+else:
+    limiter = Limiter(key_func=get_remote_address)
 
 # ==========================================
 # JOURNALISATION
 # ==========================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / "api_activity.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger("api_logger")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    fh = logging.FileHandler(LOG_DIR / "api_activity.log", encoding="utf-8")
+    fh.setFormatter(formatter)
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    logger.addHandler(fh)
+    logger.addHandler(sh)
 
 # ==========================================
 # BASE DE DONNÉES
@@ -93,35 +117,60 @@ def get_db_connection():
 # ==========================================
 api_key_header = APIKeyHeader(name="X-API-KEY", auto_error=False)
 
-def verify_api_key(api_key: str = Depends(api_key_header)):
+def hash_key(key: str) -> str:
+    return bcrypt.hashpw(key.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_key(key: str, hashed: str) -> bool:
+    try:
+        if hashed.startswith("$2b$") or hashed.startswith("$2a$") or hashed.startswith("$2y$"):
+            return bcrypt.checkpw(key.encode('utf-8'), hashed.encode('utf-8'))
+        return False
+    except Exception:
+        return False
+
+def verify_api_key(request: Request = None, api_key: str = Depends(api_key_header)):
+    client_ip = request.client.host if request.client else "unknown"
     if not api_key:
-        logger.warning("Tentative d'accès bloquée : Clé API manquante")
+        logger.warning(f"IP: {client_ip} - Tentative d'accès bloquée : Clé API manquante")
         raise HTTPException(status_code=403, detail="Une clé API est requise (Entête: X-API-KEY).")
 
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT * FROM api_keys WHERE key = ?", (api_key,))
-    key_record = c.fetchone()
+    c.execute("SELECT * FROM api_keys WHERE is_active = 1")
+    key_records = c.fetchall()
     
-    if not key_record:
-        conn.close()
-        logger.warning(f"Tentative d'accès bloquée : Clé API invalide utilisée ({api_key[:8]}...)")
-        raise HTTPException(status_code=403, detail="Clé API invalide.")
-        
-    if not key_record["is_active"]:
-        conn.close()
-        logger.warning(f"Tentative d'accès bloquée : Clé API désactivée ({key_record['email']})")
-        raise HTTPException(status_code=403, detail="Cette clé API a été désactivée.")
+    matched_record = None
+    for record in key_records:
+        if verify_key(api_key, record["key"]):
+            matched_record = record
+            break
     
-    c.execute("UPDATE api_keys SET requests_count = requests_count + 1 WHERE id = ?", (key_record["id"],))
+    if not matched_record:
+        conn.close()
+        logger.warning(f"IP: {client_ip} - Tentative d'accès bloquée : Clé API invalide utilisée ({api_key[:8]}...)")
+        raise HTTPException(status_code=403, detail="Clé API invalide ou désactivée.")
+    
+    c.execute("UPDATE api_keys SET requests_count = requests_count + 1 WHERE id = ?", (matched_record["id"],))
     conn.commit()
     conn.close()
     
-    return key_record
+    return dict(matched_record)
 
-def verify_admin(admin_key: str = Depends(APIKeyHeader(name="X-ADMIN-KEY"))):
-    if admin_key != ADMIN_SECRET_KEY:
-        logger.error("Tentative d'accès ADMINISTRATEUR refusée.")
+def verify_admin(
+    admin_key_header: str = Depends(APIKeyHeader(name="X-ADMIN-KEY", auto_error=False)),
+    admin_token: str = Cookie(default=None),
+    request: Request = None
+):
+    client_ip = request.client.host if request.client else "unknown"
+    actual_key = admin_key_header
+    if not actual_key and admin_token:
+        try:
+            actual_key = admin_cipher.decrypt(admin_token.encode('utf-8')).decode('utf-8')
+        except:
+            raise HTTPException(status_code=403, detail="Session invalide ou expirée.")
+
+    if actual_key != ADMIN_SECRET_KEY:
+        logger.error(f"IP: {client_ip} - Tentative d'accès ADMINISTRATEUR refusée.")
         raise HTTPException(status_code=403, detail="Accès administrateur refusé.")
     return True
 
@@ -155,16 +204,21 @@ async def lifespan(app: FastAPI):
     logger.info("Démarrage de l'API Superstore...")
     if model_path.exists():
         logger.info("Chargement du modèle local...")
-        ml_model = joblib.load(model_path)
+        try:
+            ml_model = joblib.load(model_path)
+            logger.info("Modèle local chargé avec succès.")
+        except Exception as e:
+            logger.error(f"Erreur lors du chargement du modèle local: {e}")
     else:
         logger.info("Modèle local absent. Téléchargement depuis HuggingFace...")
         try:
+            PREDICTOR_DIR = PERSISTENT_DIR / "predictor"
+            
             downloaded_path = hf_hub_download(
-                repo_id=HF_REPO_ID, 
-                filename="profit_predictor.joblib", 
+                repo_id=HF_REPO_ID,
+                filename="superstore_profit_predictor.joblib",
                 token=HF_TOKEN,
-                local_dir=CURRENT_DIR / "predictor",
-                cache_dir=CURRENT_DIR / "hf_cache"
+                local_dir=PREDICTOR_DIR
             )
             ml_model = joblib.load(downloaded_path)
             logger.info("Modèle téléchargé et chargé avec succès.")
@@ -325,17 +379,19 @@ async def developer_get():
 
 @app.post("/developer/generate")
 @limiter.limit("5/minute")
-async def generate_key(request: Request, first_name: str = Form(...), last_name: str = Form(...), email: str = Form(...)):
+async def generate_key(request: Request = None, first_name: str = Form(...), last_name: str = Form(...), email: str = Form(...)):
+    client_ip = request.client.host if request.client else "unknown"
     new_key = "sk_" + secrets.token_hex(16)
+    hashed_key = hash_key(new_key)
     
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("INSERT INTO api_keys (key, first_name, last_name, email) VALUES (?, ?, ?, ?)", 
-              (new_key, first_name, last_name, email))
+              (hashed_key, first_name, last_name, email))
     conn.commit()
     conn.close()
     
-    logger.info(f"Nouvelle clé générée via le portail développeur : {first_name} {last_name} ({email}).")
+    logger.info(f"IP: {client_ip} - Nouvelle clé générée via le portail développeur : {first_name} {last_name} ({email}).")
     msg = f"Clé générée pour {first_name} {last_name}."
     
     return {"message": msg, "api_key": new_key}
@@ -475,328 +531,372 @@ def read_root():
 
 @app.post("/predict", response_model=PredictionResponse)
 @limiter.limit("60/minute") 
-def predict_profit(request: Request, record: SaleRecord, key_info: dict = Depends(verify_api_key)):
+def predict_profit(record: SaleRecord, request: Request = None, key_info: dict = Depends(verify_api_key)):
+    client_ip = request.client.host if request.client else "unknown"
     if ml_model is None:
         raise HTTPException(status_code=503, detail="Modèle indisponible")
     
-    input_df = pd.DataFrame([{
-        'Sales': record.Sales, 'Discount': record.Discount, 
-        'Sub-Category': record.Sub_Category, 'Region': record.Region, 'Segment': record.Segment
-    }])
-    pred_log = ml_model.predict(input_df)[0]
-    pred_profit = np.sign(pred_log) * np.expm1(np.abs(pred_log))
-    
-    logger.info(f"Prédiction réussie (user: {key_info['email']} | requête: single)")
-    return {"predicted_profit": float(pred_profit)}
+    try:
+        input_df = pd.DataFrame([{
+            'Sales': record.Sales, 'Discount': record.Discount, 
+            'Sub-Category': record.Sub_Category, 'Region': record.Region, 'Segment': record.Segment
+        }])
+        pred_log = ml_model.predict(input_df)[0]
+        pred_profit = np.sign(pred_log) * np.expm1(np.abs(pred_log))
+        
+        logger.info(f"IP: {client_ip} - Prédiction réussie (user: {key_info['email']} | requête: single)")
+        return {"predicted_profit": float(pred_profit)}
+    except Exception as e:
+        logger.error(f"IP: {client_ip} - Erreur modèle single: {str(e)}")
+        raise HTTPException(status_code=500, detail="Erreur interne lors de la prédiction")
 
 @app.post("/predict_batch", response_model=BatchPredictionResponse)
 @limiter.limit("20/minute") 
-def predict_batch_profit(request: Request, batch: BatchSaleRecord, key_info: dict = Depends(verify_api_key)):
+def predict_batch_profit(batch: BatchSaleRecord, request: Request = None, key_info: dict = Depends(verify_api_key)):
+    client_ip = request.client.host if request.client else "unknown"
     if ml_model is None:
         raise HTTPException(status_code=503, detail="Modèle indisponible")
     try:
-        import pandas as pd
-        import numpy as np
         df = pd.DataFrame([r.model_dump() for r in batch.records])
         df = df.rename(columns={'Sub_Category': 'Sub-Category'})
         df = df[['Sales', 'Discount', 'Sub-Category', 'Region', 'Segment']]
         logs_pred = ml_model.predict(df)
         preds = np.sign(logs_pred) * np.expm1(np.abs(logs_pred))
-        logger.info(f"Prédiction batch réussie (user: {key_info['email']} | taille: {len(df)})")
+        logger.info(f"IP: {client_ip} - Prédiction batch réussie (user: {key_info['email']} | taille: {len(df)})")
         return {"predictions": preds.tolist()}
     except Exception as e:
-        logger.error(f"Erreur modèle batch: {str(e)}")
+        logger.error(f"IP: {client_ip} - Erreur modèle batch: {str(e)}")
         raise HTTPException(status_code=500, detail="Erreur interne lors de la prédiction en lot")
 
-def get_admin_login(error_msg=""):
-    err_html = f"<p style='color:red;'>{error_msg}</p>" if error_msg else ""
-    return f'''
-    <!DOCTYPE html>
-    <html><head><title>Admin Login - API</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📊</text></svg>">
-    <style>body{{font-family:sans-serif; max-width: 400px; margin: 50px auto; text-align:center;}}</style>
-    </head><body>
-    <h2>Accès Administrateur</h2>
-    {err_html}
-    <form action="/admin/dashboard" method="post">
-        <input type="password" name="admin_key" placeholder="Clé secrète admin" required style="width:100%; padding:10px; margin-bottom:10px; box-sizing:border-box;">
-        <button type="submit" style="width:100%; padding:10px; background:#007bff; color:#fff; border:none; cursor:pointer;">Se connecter</button>
-    </form>
-    </body></html>
-    '''
-
-@app.get("/admin/dashboard", response_class=HTMLResponse)
-def admin_dashboard_get():
-    return HTMLResponse(content=get_admin_login())
-
-@app.post("/admin/dashboard", response_class=HTMLResponse)
-def admin_dashboard_post(request: Request, admin_key: str = Form(...)):
-    if admin_key != str(ADMIN_SECRET_KEY):
-        logger.warning("Echec de connexion à l'interface d'administration.")
-        return HTMLResponse(content=get_admin_login("Clé secrète incorrecte."))
-    
-    html = f'''
-    <!DOCTYPE html>
+def get_admin_dashboard_html():
+    return """<!DOCTYPE html>
     <html lang="fr">
     <head>
         <meta charset="UTF-8">
         <title>Dashboard Admin - API</title>
         <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚡</text></svg>">
         <style>
-            body{{font-family: -apple-system, system-ui, sans-serif; margin: 20px; color: #333; background: #f8f9fa;}}
-            .header{{display:flex; justify-content:space-between; align-items:center; background:#fff; padding:15px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.1); margin-bottom:20px;}}
-            .panel{{background:#fff; padding:20px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.1);}}
-            table{{width: 100%; border-collapse: collapse; margin-top:20px; font-size:14px;}}
-            th, td{{padding: 12px; border-bottom: 1px solid #dee2e6; text-align: left;}}
-            th{{background: #e9ecef; font-weight:600;}}
-            code{{background:#f1f3f5; padding:3px 6px; border-radius:4px; font-family:monospace; color:#d63384;}}
-            .badge-active{{background:#d4edda; color:#155724; padding:3px 8px; border-radius:12px; font-size:0.85em;}}
-            .badge-inactive{{background:#f8d7da; color:#721c24; padding:3px 8px; border-radius:12px; font-size:0.85em;}}
-            .btn{{padding:6px 12px; border:none; border-radius:4px; cursor:pointer; font-size:0.9em; transition:0.2s;}}
-            .btn-primary{{background:#007bff; color:white;}}
-            .btn-primary:hover{{background:#0056b3;}}
-            .btn-danger{{background:#dc3545; color:white;}}
-            .btn-danger:hover{{background:#c82333;}}
-            .btn-warning{{background:#ffc107; color:#212529;}}
-            .btn-secondary{{background:#6c757d; color:white;}}
-            select, input{{padding:8px; border:1px solid #ced4da; border-radius:4px;}}
-            /* MODAL STYLES */
-            .modal {{display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); align-items:center; justify-content:center; z-index:1000;}}
-            .modal-content {{background:#fff; padding:20px; border-radius:8px; width:400px; max-width:90%; position:relative; box-shadow:0 4px 6px rgba(0,0,0,0.1);}}
-            .modal-content h3 {{margin-top:0; border-bottom:1px solid #eee; padding-bottom:10px;}}
-            .form-group {{margin-bottom:15px; text-align:left;}}
-            .form-group label {{display:block; margin-bottom:5px; font-weight:500;}}
-            .form-group input, .form-group select {{width:100%; box-sizing:border-box;}}
-            .modal-actions {{display:flex; justify-content:flex-end; gap:10px; margin-top:20px;}}
+            body{font-family: -apple-system, system-ui, sans-serif; margin: 20px; color: #333; background: #f8f9fa;}
+            .header{display:flex; justify-content:space-between; align-items:center; background:#fff; padding:15px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.1); margin-bottom:20px;}
+            .panel{background:#fff; padding:20px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.1);}
+            table{width: 100%; border-collapse: collapse; margin-top:20px; font-size:14px;}
+            th, td{padding: 12px; border-bottom: 1px solid #dee2e6; text-align: left;}
+            th{background: #e9ecef; font-weight:600;}
+            code{background:#f1f3f5; padding:3px 6px; border-radius:4px; font-family:monospace; color:#d63384;}
+            .badge-active{background:#d4edda; color:#155724; padding:3px 8px; border-radius:12px; font-size:0.85em;}
+            .badge-inactive{background:#f8d7da; color:#721c24; padding:3px 8px; border-radius:12px; font-size:0.85em;}
+            .btn{padding:6px 12px; border:none; border-radius:4px; cursor:pointer; font-size:0.9em; transition:0.2s;}
+            .btn-primary{background:#007bff; color:white;}
+            .btn-primary:hover{background:#0056b3;}
+            .btn-danger{background:#dc3545; color:white;}
+            .btn-danger:hover{background:#c82333;}
+            .btn-warning{background:#ffc107; color:#212529;}
+            .btn-secondary{background:#6c757d; color:white;}
+            select, input{padding:8px; border:1px solid #ced4da; border-radius:4px;}
+            .modal {display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); align-items:center; justify-content:center; z-index:1000;}
+            .modal-content {background:#fff; padding:20px; border-radius:8px; width:400px; max-width:90%; position:relative; box-shadow:0 4px 6px rgba(0,0,0,0.1);}
+            .modal-content h3 {margin-top:0; border-bottom:1px solid #eee; padding-bottom:10px;}
+            .form-group {margin-bottom:15px; text-align:left;}
+            .form-group label {display:block; margin-bottom:5px; font-weight:500;}
+            .form-group input, .form-group select {width:100%; box-sizing:border-box;}
+            .modal-actions {display:flex; justify-content:flex-end; gap:10px; margin-top:20px;}
+            #loginSection {max-width: 400px; margin: 100px auto;text-align:center;}
         </style>
     </head>
     <body>
-        <!-- MODAL HTML -->
-        <div id="keyModal" class="modal">
-            <div class="modal-content">
-                <h3 id="modalTitle">Nouvelle Clé</h3>
-                <div class="form-group">
-                    <label>Prénom</label>
-                    <input type="text" id="mFirstName" placeholder="Prénom">
+        <!-- LOGIN VIEW -->
+        <div id="loginSection">
+            <h2>Accès Administrateur</h2>
+            <div id="loginError" style="color:red; margin-bottom:10px; display:none;">Clé incorrecte</div>
+            <input type="password" id="loginKey" placeholder="Clé secrète admin" required style="width:100%; padding:10px; margin-bottom:10px; box-sizing:border-box;">
+            <button onclick="login()" style="width:100%; padding:10px; background:#007bff; color:#fff; border:none; cursor:pointer; border-radius:4px;">Se connecter</button>
+        </div>
+
+        <!-- DASHBOARD VIEW -->
+        <div id="dashboardSection" style="display:none;">
+            <!-- MODAL NEW KEY -->
+            <div id="keyModal" class="modal">
+                <div class="modal-content">
+                    <h3 id="modalTitle">Nouvelle Clé</h3>
+                    <div class="form-group">
+                        <label>Prénom</label>
+                        <input type="text" id="mFirstName" placeholder="Prénom">
+                    </div>
+                    <div class="form-group">
+                        <label>Nom</label>
+                        <input type="text" id="mLastName" placeholder="Nom">
+                    </div>
+                    <div class="form-group">
+                        <label>Email</label>
+                        <input type="email" id="mEmail" placeholder="Email">
+                    </div>
+                    <div class="form-group">
+                        <label>Tier</label>
+                        <select id="mTier">
+                            <option value="free">Free</option>
+                            <option value="premium">Premium</option>
+                            <option value="enterprise">Enterprise</option>
+                        </select>
+                    </div>
+                    <div class="modal-actions">
+                        <button class="btn btn-secondary" onclick="closeModal()">Annuler</button>
+                        <button class="btn btn-primary" onclick="saveKey()">Enregistrer</button>
+                    </div>
                 </div>
-                <div class="form-group">
-                    <label>Nom</label>
-                    <input type="text" id="mLastName" placeholder="Nom">
+            </div>
+
+            <!-- MODAL COPY KEY -->
+            <div id="copyModal" class="modal">
+                <div class="modal-content" style="text-align:center;">
+                    <h3>Clé générée avec succès 🎉</h3>
+                    <p style="margin-bottom:15px; font-size:14px; color:#555;">Veuillez copier votre clé ci-dessous. Elle ne sera plus affichée en entier une fois cette fenêtre fermée !</p>
+                    <code id="newKeyText" style="display:block; padding:15px; background:#f4f4f4; border:1px solid #ddd; font-size:16px; margin-bottom:20px; word-break:break-all;"></code>
+                    <div class="modal-actions" style="justify-content:center; gap:15px;">
+                        <button class="btn btn-primary" onclick="copyNewKey()" style="flex:1;">📋 Copier la clé</button>
+                        <button class="btn btn-secondary" onclick="closeCopyModal()" style="flex:1;">Fermer</button>
+                    </div>
                 </div>
-                <div class="form-group">
-                    <label>Email</label>
-                    <input type="email" id="mEmail" placeholder="Email">
+            </div>
+
+            <div class="header">
+                <h2 style="margin:0;">⚡ Console d'Administration API</h2>
+                <div>
+                    <button class="btn btn-secondary" onclick="logout()" style="margin-right:10px;">Déconnexion</button>
+                    <button class="btn btn-primary" onclick="openModal(false)">+ Nouvelle Clé</button>
                 </div>
-                <div class="form-group">
-                    <label>Tier</label>
-                    <select id="mTier">
-                        <option value="free">Free</option>
-                        <option value="premium">Premium</option>
-                        <option value="enterprise">Enterprise</option>
+            </div>
+            
+            <div class="panel">
+                <div style="display:flex; gap:10px; margin-bottom:15px;">
+                    <select id="filterColumn" onchange="renderTable()" style="width: auto;">
+                        <option value="all">📝 Toutes les colonnes</option>
+                        <option value="first_name">Prénom</option>
+                        <option value="last_name">Nom</option>
+                        <option value="email">Email</option>
+                        <option value="key">Clé</option>
+                        <option value="tier">Tier</option>
                     </select>
+                    <input type="text" id="filterValue" placeholder="Rechercher..." onkeyup="renderTable()" style="flex:1; max-width:300px;">
+                    <span id="stats" style="margin-left:auto; font-weight:bold; color:#6c757d;"></span>
                 </div>
-                <div class="modal-actions">
-                    <button class="btn btn-secondary" onclick="closeModal()">Annuler</button>
-                    <button class="btn btn-primary" onclick="saveKey()">Enregistrer</button>
-                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>N°</th>
+                            <th>Utilisateur</th>
+                            <th>Email</th>
+                            <th>Clé API</th>
+                            <th>Tier</th>
+                            <th>Requêtes</th>
+                            <th>Statut</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="keysBody">
+                        <tr><td colspan="8" style="text-align:center;">Chargement...</td></tr>
+                    </tbody>
+                </table>
             </div>
-        </div>
-
-        <div class="header">
-            <h2 style="margin:0;">⚡ Console d'Administration API</h2>
-            <div>
-                <button class="btn btn-primary" onclick="openModal(false)">+ Nouvelle Clé</button>
-            </div>
-        </div>
-        
-        <div class="panel">
-            <div style="display:flex; gap:15px; margin-bottom:15px; align-items:center;">
-                <select id="filterColumn" onchange="renderTable()" style="width: auto;">
-                    <option value="all">📝 Toutes les colonnes</option>
-                    <option value="first_name">Prénom</option>
-                    <option value="last_name">Nom</option>
-                    <option value="email">Email</option>
-                    <option value="key">Clé</option>
-                    <option value="tier">Tier</option>
-                </select>
-                <input type="text" id="filterValue" placeholder="Rechercher (ex: nom, email...)" onkeyup="renderTable()" style="flex:1; max-width:300px;">
-                <span id="stats" style="margin-left:auto; font-weight:bold; color:#6c757d;"></span>
-            </div>
-
-            <table>
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>Utilisateur</th>
-                        <th>Email</th>
-                        <th>Clé (Aperçu)</th>
-                        <th>Tier</th>
-                        <th>Requêtes</th>
-                        <th>Statut</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="keysBody">
-                    <tr><td colspan="8" style="text-align:center;">Chargement des données...</td></tr>
-                </tbody>
-            </table>
         </div>
 
         <script>
-            const ADMIN_KEY = "{admin_key}";
             let allKeys = [];
 
-            async function apiCall(endpoint, method = 'GET', body = null) {{
-                const options = {{
+            async function checkAuthAndLoad() {
+                try {
+                    const data = await apiCall('/admin/keys');
+                    allKeys = data.keys || [];
+                    showDashboard();
+                    renderTable();
+                } catch(e) {
+                    showLogin();
+                }
+            }
+
+            function showLogin() {
+                document.getElementById('loginSection').style.display = 'block';
+                document.getElementById('dashboardSection').style.display = 'none';
+            }
+
+            function showDashboard() {
+                document.getElementById('loginSection').style.display = 'none';
+                document.getElementById('dashboardSection').style.display = 'block';
+            }
+
+            async function login() {
+                const key = document.getElementById('loginKey').value.trim();
+                if(!key) return;
+                try {
+                    const res = await fetch('/admin/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ admin_key: key })
+                    });
+                    if(!res.ok) throw new Error("Incorrect");
+                    
+                    const data = await apiCall('/admin/keys');
+                    allKeys = data.keys || [];
+                    showDashboard();
+                    renderTable();
+                    document.getElementById('loginKey').value = '';
+                    document.getElementById('loginError').style.display = 'none';
+                } catch(e) {
+                    document.getElementById('loginError').style.display = 'block';
+                }
+            }
+
+            async function logout() {
+                try {
+                    await fetch('/admin/logout', { method: 'POST' });
+                } catch(e) {}
+                showLogin();
+            }
+
+            async function apiCall(endpoint, method = 'GET', body = null) {
+                const options = {
                     method: method,
-                    headers: {{
-                        'X-ADMIN-KEY': ADMIN_KEY,
-                        'Content-Type': 'application/json'
-                    }}
-                }};
+                    headers: { 'Content-Type': 'application/json' }
+                };
                 if(body) options.body = JSON.stringify(body);
-                try {{
-                    const res = await fetch(endpoint, options);
-                    if(!res.ok) throw new Error(await res.text());
-                    return await res.json();
-                }} catch(e) {{
-                    alert("Erreur: " + e.message);
-                    throw e;
-                }}
-            }}
+                const res = await fetch(endpoint, options);
+                if(res.status === 403) {
+                    showLogin();
+                    throw new Error("Unauthorized");
+                }
+                if(!res.ok) throw new Error(await res.text());
+                return await res.json();
+            }
 
-            async function loadKeys() {{
-                const data = await apiCall('/admin/keys');
-                allKeys = data.keys || [];
-                renderTable();
-            }}
-
-            function renderTable() {{
+            function renderTable() {
                 const col = document.getElementById('filterColumn').value;
                 const val = document.getElementById('filterValue').value.toLowerCase();
-                
-                let keysToRender = allKeys.filter(k => {{
+                let keysToRender = allKeys.filter(k => {
                     if (!val) return true;
-                    if (col === 'all') {{
+                    if (col === 'all') {
                         return (k.first_name||'').toLowerCase().includes(val) || 
                                (k.last_name||'').toLowerCase().includes(val) || 
                                (k.email||'').toLowerCase().includes(val) || 
                                (k.key||'').toLowerCase().includes(val) ||
                                (k.tier||'').toLowerCase().includes(val);
-                    }} else {{
+                    } else {
                         return (k[col]||'').toLowerCase().includes(val);
-                    }}
-                }});
+                    }
+                });
 
                 const tbody = document.getElementById('keysBody');
-                if(keysToRender.length === 0) {{
+                if(keysToRender.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;">Aucune clé trouvée.</td></tr>';
-                }} else {{
+                } else {
                     tbody.innerHTML = keysToRender.map((k, index) => `
                         <tr>
-                            <td>#${{index + 1}}</td>
-                            <td><strong>${{k.first_name}} ${{k.last_name}}</strong></td>
-                            <td>${{k.email}}</td>
-                            <td title="${{k.key}}"><code>${{k.key.substring(0,8)}}...</code></td>
-                            <td><span style="text-transform:capitalize">${{k.tier}}</span></td>
-                            <td><strong>${{k.requests_count}}</strong></td>
-                            <td>${{k.is_active ? '<span class="badge-active">Actif</span>' : '<span class="badge-inactive">Inactif</span>'}}</td>
+                            <td>#${index + 1}</td>
+                            <td><strong>${k.first_name} ${k.last_name}</strong></td>
+                            <td>${k.email}</td>
+                            <td title="Clé Hachée (Indéchiffrable)"><code>🔒 ${k.key}</code></td>
+                            <td><span style="text-transform:capitalize">${k.tier}</span></td>
+                            <td><strong>${k.requests_count}</strong></td>
+                            <td>${k.is_active ? '<span class="badge-active">Actif</span>' : '<span class="badge-inactive">Inactif</span>'}</td>
                             <td>
-                                <button class="btn ${{k.is_active ? 'btn-secondary' : 'btn-primary'}}" onclick="toggleKey(${{k.id}}, ${{k.is_active}})">
-                                    ${{k.is_active ? 'Désactiver' : 'Activer'}}
+                                <button class="btn ${k.is_active ? 'btn-secondary' : 'btn-primary'}" onclick="toggleKey(${k.id}, ${k.is_active})">
+                                    ${k.is_active ? 'Désactiver' : 'Activer'}
                                 </button>
-                                <button class="btn btn-warning" onclick="openModal(true, ${{k.id}})">✏️ Editer</button>
-                                <button class="btn btn-danger" onclick="deleteKey(${{k.id}})">🗑️ Sup.</button>
+                                <button class="btn btn-warning" onclick="openModal(true, ${k.id})">✏️ Editer</button>
+                                <button class="btn btn-danger" onclick="deleteKey(${k.id})">🗑️ Sup.</button>
                             </td>
                         </tr>
                     `).join('');
-                }}
-                
+                }
                 document.getElementById('stats').innerText = keysToRender.length + " clés affichées au total (" + allKeys.reduce((acc, k) => acc + k.requests_count, 0) + " requêtes cumulées)";
-            }}
-
-            async function toggleKey(id, isActive) {{
-                const action = isActive ? 'deactivate' : 'activate';
-                await apiCall(`/admin/keys/${{id}}/${{action}}`, 'PATCH');
-                loadKeys();
-            }}
-
-            async function deleteKey(id) {{
-                if(confirm("Êtes-vous sûr de vouloir supprimer définitivement cette clé ? Cette action est irréversible.")) {{
-                    await apiCall(`/admin/keys/${{id}}`, 'DELETE');
-                    loadKeys();
-                }}
-            }}
+            }
 
             let currentEditId = null;
-
-            function openModal(isEdit, id = null) {{
-                const modal = document.getElementById('keyModal');
-                modal.style.display = 'flex';
-                
-                if (isEdit && id) {{
+            function openModal(edit, id = null) {
+                document.getElementById('keyModal').style.display = 'flex';
+                if (edit && id) {
                     const k = allKeys.find(x => x.id === id);
                     if(!k) return closeModal();
-                    document.getElementById('modalTitle').innerText = 'Modifier la clé';
+                    document.getElementById('modalTitle').innerText = 'Editer la Clé';
                     document.getElementById('mFirstName').value = k.first_name;
                     document.getElementById('mLastName').value = k.last_name;
                     document.getElementById('mEmail').value = k.email;
                     document.getElementById('mTier').value = k.tier;
                     currentEditId = k.id;
-                }} else {{
+                } else {
                     document.getElementById('modalTitle').innerText = 'Nouvelle Clé';
                     document.getElementById('mFirstName').value = '';
                     document.getElementById('mLastName').value = '';
                     document.getElementById('mEmail').value = '';
                     document.getElementById('mTier').value = 'free';
                     currentEditId = null;
-                }}
-            }}
+                }
+            }
 
-            function closeModal() {{
-                document.getElementById('keyModal').style.display = 'none';
-            }}
+            function closeModal() { document.getElementById('keyModal').style.display = 'none'; }
+            function closeCopyModal() { document.getElementById('copyModal').style.display = 'none'; }
 
-            async function saveKey() {{
+            function copyNewKey() {
+                navigator.clipboard.writeText(document.getElementById('newKeyText').innerText);
+                alert("Clé copiée au presse-papiers !");
+            }
+
+            async function saveKey() {
                 const newFn = document.getElementById('mFirstName').value.trim();
                 const newLn = document.getElementById('mLastName').value.trim();
                 const newEm = document.getElementById('mEmail').value.trim();
                 const newTi = document.getElementById('mTier').value;
 
-                if (!newFn || !newLn || !newEm) {{
-                    alert("Veuillez remplir tous les champs.");
-                    return;
-                }}
+                if (!newFn || !newLn || !newEm) { alert("Veuillez remplir tous les champs."); return; }
                 
-                try {{
-                    if (currentEditId) {{
-                        await apiCall(`/admin/keys/${{currentEditId}}`, 'PUT', {{
-                            first_name: newFn, 
-                            last_name: newLn, 
-                            email: newEm, 
-                            tier: newTi
-                        }});
-                    }} else {{
-                        await apiCall(`/admin/keys/create`, 'POST', {{
-                            first_name: newFn,
-                            last_name: newLn,
-                            email: newEm,
-                            tier: newTi
-                        }});
-                    }}
-                    closeModal();
-                    loadKeys();
-                }} catch(e) {{
-                    console.error("Erreur lors de l'enregistrement :", e);
-                }}
-            }}
+                try {
+                    if (currentEditId) {
+                        await apiCall(`/admin/keys/${currentEditId}`, 'PUT', { first_name: newFn, last_name: newLn, email: newEm, tier: newTi });
+                        closeModal();
+                    } else {
+                        const response = await apiCall(`/admin/keys/create`, 'POST', { first_name: newFn, last_name: newLn, email: newEm, tier: newTi });
+                        closeModal();
+                        document.getElementById('newKeyText').innerText = response.key;
+                        document.getElementById('copyModal').style.display = 'flex';
+                    }
+                    const data = await apiCall('/admin/keys');
+                    allKeys = data.keys || [];
+                    renderTable();
+                } catch(e) { console.error(e); }
+            }
 
-            window.onload = loadKeys;
+            async function deleteKey(id) {
+                if(!confirm("Êtes-vous sûr de vouloir supprimer cette clé ?")) return;
+                try {
+                    await apiCall(`/admin/keys/${id}`, 'DELETE');
+                    const data = await apiCall('/admin/keys');
+                    allKeys = data.keys || [];
+                    renderTable();
+                } catch(e) { console.error(e); }
+            }
+
+            async function toggleKey(id, currentStatus) {
+                const action = currentStatus ? 'deactivate' : 'activate';
+                try {
+                    await apiCall(`/admin/keys/${id}/${action}`, 'PATCH');
+                } catch (e) {
+                    try {
+                        await apiCall(`/admin/keys/${id}/status`, 'PUT', { is_active: !currentStatus });
+                    } catch(e2) { console.error(e2); }
+                }
+                try {
+                    const data = await apiCall('/admin/keys');
+                    allKeys = data.keys || [];
+                    renderTable();
+                } catch(e) { console.error(e); }
+            }
+
+            window.onload = checkAuthAndLoad;
         </script>
     </body>
-    </html>
-    '''
-    return HTMLResponse(html)
+    </html>"""
+
+@app.get("/admin/dashboard", response_class=HTMLResponse)
+def admin_dashboard_get():
+    return HTMLResponse(content=get_admin_dashboard_html())
 
 class AdminKeyInput(BaseModel):
     first_name: str
@@ -805,15 +905,44 @@ class AdminKeyInput(BaseModel):
     tier: str
 
 @app.post("/admin/keys/create")
-def admin_create_key(data: AdminKeyInput, is_admin: bool = Depends(verify_admin)):
+def admin_create_key(data: AdminKeyInput, request: Request = None, is_admin: bool = Depends(verify_admin)):
+    client_ip = request.client.host if request.client else "unknown"
     new_key = "sk_" + secrets.token_hex(16)
+    hashed_key = hash_key(new_key)
     conn = get_db_connection()
     conn.cursor().execute("INSERT INTO api_keys (key, first_name, last_name, email, tier) VALUES (?, ?, ?, ?, ?)", 
-                          (new_key, data.first_name, data.last_name, data.email, data.tier))
+                          (hashed_key, data.first_name, data.last_name, data.email, data.tier))
     conn.commit()
     conn.close()
-    logger.info(f"ADMIN: Nouvelle clé créée manuellement pour {data.email} (Tier: {data.tier})")
+    logger.info(f"IP: {client_ip} - ADMIN: Nouvelle clé créée manuellement pour {data.email} (Tier: {data.tier})")
     return {"message": "Clé créée", "email": data.email, "key": new_key, "tier": data.tier}
+
+class AdminLoginData(BaseModel):
+    admin_key: str
+
+@app.post("/admin/login")
+def admin_login(data: AdminLoginData, response: Response, request: Request = None):
+    client_ip = request.client.host if request and request.client else "unknown"
+    if data.admin_key != ADMIN_SECRET_KEY:
+        logger.warning(f"IP: {client_ip} - ADMIN: Tentative de connexion échouée (Clé incorrecte).")
+        raise HTTPException(status_code=403, detail="Clé incorrecte")
+        
+    logger.info(f"IP: {client_ip} - ADMIN: Connexion réussie.")
+    encrypted_admin_key = admin_cipher.encrypt(data.admin_key.encode('utf-8')).decode('utf-8')
+    response.set_cookie(
+        key="admin_token", 
+        value=encrypted_admin_key, 
+        httponly=True, 
+        secure=True, 
+        samesite="strict",
+        max_age=7 * 24 * 3600
+    )
+    return {"message": "Login successful"}
+
+@app.post("/admin/logout")
+def admin_logout(response: Response):
+    response.delete_cookie("admin_token")
+    return {"message": "Logout successful"}
 
 @app.get("/admin/keys")
 def admin_list_keys(is_admin: bool = Depends(verify_admin)):
@@ -822,41 +951,53 @@ def admin_list_keys(is_admin: bool = Depends(verify_admin)):
     c.execute("SELECT id, key, first_name, last_name, email, created_at, requests_count, is_active, tier FROM api_keys ORDER BY requests_count DESC")
     keys = [dict(row) for row in c.fetchall()]
     conn.close()
+    
+    for k in keys:
+        if k['key'] and k['key'].startswith('$2b$'):
+            salt_part = k['key'].split('$')[3][:6] if len(k['key'].split('$'))>3 else "hachée"
+            k['key'] = f"(Hachée bcrypt) ...{salt_part}"
+        elif k['key']:
+            k['key'] = k['key'][:5] + "..." + k['key'][-4:]
+            
     return {"total_keys": len(keys), "keys": keys}
 
 @app.put("/admin/keys/{key_id}")
-def admin_update_key(key_id: int, data: AdminKeyInput, is_admin: bool = Depends(verify_admin)):
+def admin_update_key(key_id: int, data: AdminKeyInput, request: Request = None, is_admin: bool = Depends(verify_admin)):
+    client_ip = request.client.host if request.client else "unknown"
     conn = get_db_connection()
     conn.cursor().execute("UPDATE api_keys SET first_name=?, last_name=?, email=?, tier=? WHERE id=?", 
                           (data.first_name, data.last_name, data.email, data.tier, key_id))
     conn.commit()
     conn.close()
-    logger.info(f"ADMIN: Informations de la clé n°{key_id} mises à jour.")
+    logger.info(f"IP: {client_ip} - ADMIN: Informations de la clé n°{key_id} mises à jour.")
     return {"message": f"Clé {key_id} mise à jour."}
 
 @app.delete("/admin/keys/{key_id}")
-def admin_delete_key(key_id: int, is_admin: bool = Depends(verify_admin)):
+def admin_delete_key(key_id: int, request: Request = None, is_admin: bool = Depends(verify_admin)):
+    client_ip = request.client.host if request.client else "unknown"
     conn = get_db_connection()
     conn.cursor().execute("DELETE FROM api_keys WHERE id=?", (key_id,))
     conn.commit()
     conn.close()
-    logger.info(f"ADMIN: Clé n°{key_id} SUPPRIMÉE de la base de données.")
+    logger.info(f"IP: {client_ip} - ADMIN: Clé n°{key_id} SUPPRIMÉE de la base de données.")
     return {"message": f"Clé {key_id} supprimée définitivement."}
 
 @app.patch("/admin/keys/{key_id}/deactivate")
-def admin_deactivate_key(key_id: int, is_admin: bool = Depends(verify_admin)):
+def admin_deactivate_key(key_id: int, request: Request = None, is_admin: bool = Depends(verify_admin)):
+    client_ip = request.client.host if request.client else "unknown"
     conn = get_db_connection()
     conn.cursor().execute("UPDATE api_keys SET is_active = 0 WHERE id = ?", (key_id,))
     conn.commit()
     conn.close()
-    logger.info(f"ADMIN: Clé n°{key_id} désactivée.")
+    logger.info(f"IP: {client_ip} - ADMIN: Clé n°{key_id} désactivée.")
     return {"message": f"Clé {key_id} désactivée avec succès."}
 
 @app.patch("/admin/keys/{key_id}/activate")
-def admin_activate_key(key_id: int, is_admin: bool = Depends(verify_admin)):
+def admin_activate_key(key_id: int, request: Request = None, is_admin: bool = Depends(verify_admin)):
+    client_ip = request.client.host if request.client else "unknown"
     conn = get_db_connection()
     conn.cursor().execute("UPDATE api_keys SET is_active = 1 WHERE id = ?", (key_id,))
     conn.commit()
     conn.close()
-    logger.info(f"ADMIN: Clé n°{key_id} activée.")
+    logger.info(f"IP: {client_ip} - ADMIN: Clé n°{key_id} activée.")
     return {"message": f"Clé {key_id} activée avec succès."}

@@ -1,0 +1,15 @@
+python-multipart
+fastapi
+uvicorn
+pandas
+numpy
+scikit-learn
+joblib
+slowapi
+pydantic
+python-dotenv
+huggingface_hub
+jinja2
+cryptography
+bcrypt
+redis

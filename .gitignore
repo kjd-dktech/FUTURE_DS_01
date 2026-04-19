@@ -2,6 +2,7 @@ data/
 model/
 assets/exports/
 logs/
+.logs/
 db/
 __pycache__/
 __init__.py
@@ -10,4 +11,5 @@ superstoreSAvenv
 *cache*
 *.log
 *.db
+*.cookie*
 later.txt

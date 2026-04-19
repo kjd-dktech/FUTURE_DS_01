@@ -4,36 +4,39 @@
 #=============================================================
 
 import streamlit as st
+from streamlit import iframe as stif
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
-import sys
 import requests
 from pathlib import Path
 import io
 from datetime import datetime
 from dotenv import load_dotenv
+from cryptography.fernet import Fernet
+import time
+import hashlib
+import base64
 
 load_dotenv()
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 CURRENT_FILE_DIR = Path(__file__).resolve().parent
-ROOT_DIR = CURRENT_FILE_DIR.parent
-data_path = ROOT_DIR / "data" / "processed" / "superstore_processed.csv"
-sys.path.append(str(ROOT_DIR))
-
-from src.utils import get_us_state_abbrev
+data_path = CURRENT_FILE_DIR / "superstore_processed.csv"
 
 st.set_page_config(page_title="Superstore Analytics", page_icon="📊", layout="wide")
 
 # --- HISTORIQUE EN SESSION ---
-history_dir = ROOT_DIR / "data" / "logs"
-os.makedirs(history_dir, exist_ok=True)
+history_dir = CURRENT_FILE_DIR / "logs"
+try:
+    os.makedirs(history_dir, exist_ok=True)
+except Exception:
+    pass
+
 sim_history_file = history_dir / "sim_history.csv"
 batch_history_file = history_dir / "batch_history.csv"
-api_key_file = history_dir / ".api_key"
 
 if 'sim_history' not in st.session_state:
     if sim_history_file.exists():
@@ -53,9 +56,38 @@ if 'batch_history' not in st.session_state:
     else:
         st.session_state['batch_history'] = []
 
+STREAMLIT_COOKIE_SECRET = os.getenv("STREAMLIT_COOKIE_SECRET", "super_secret_par_defaut")
+
+_cookie_hash = hashlib.sha256(STREAMLIT_COOKIE_SECRET.encode('utf-8')).digest()
+FERNET_KEY = base64.urlsafe_b64encode(_cookie_hash)
+cipher = Fernet(FERNET_KEY)
+
+def get_cookie(cookie_name):
+    if hasattr(st, "context") and hasattr(st.context, "cookies"):
+        return st.context.cookies.get(cookie_name)
+    return None
+
+def set_cookie_js(name, value, max_age_days=7):
+    stif(f"""
+        <script>
+            document.cookie = "{name}={value}; max-age={max_age_days*86400}; path=/; SameSite=Strict; Secure";
+        </script>
+    """, height=1)
+
+def clear_cookie_js(name):
+    stif(f"""
+        <script>
+            document.cookie = "{name}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; SameSite=Strict; Secure";
+        </script>
+    """, height=1)
+
 if 'api_key_val' not in st.session_state:
-    if api_key_file.exists():
-        st.session_state['api_key_val'] = api_key_file.read_text().strip()
+    encrypted_cookie = get_cookie('app_key')
+    if encrypted_cookie:
+        try:
+            st.session_state['api_key_val'] = cipher.decrypt(encrypted_cookie.encode()).decode()
+        except:
+            st.session_state['api_key_val'] = ""
     else:
         st.session_state['api_key_val'] = ""
 
@@ -63,16 +95,19 @@ def save_api_key():
     val = st.session_state.get('api_input', '')
     st.session_state['api_key_val'] = val
     if val:
-        api_key_file.write_text(val)
+        encrypted_val = cipher.encrypt(val.encode()).decode()
+        set_cookie_js('app_key', encrypted_val)
     else:
-        if api_key_file.exists():
-            api_key_file.unlink()
+        clear_cookie_js('app_key')
 
 def save_history_to_disk(history_type):
-    if history_type == 'sim':
-        pd.DataFrame(st.session_state['sim_history']).to_csv(sim_history_file, index=False)
-    elif history_type == 'batch':
-        pd.DataFrame(st.session_state['batch_history']).to_csv(batch_history_file, index=False)
+    try:
+        if history_type == 'sim':
+            pd.DataFrame(st.session_state['sim_history']).to_csv(sim_history_file, index=False)
+        elif history_type == 'batch':
+            pd.DataFrame(st.session_state['batch_history']).to_csv(batch_history_file, index=False)
+    except Exception:
+        pass
 
 def read_data_robust(file_obj, file_name=""):
     if file_name.endswith('.json'):
@@ -91,12 +126,38 @@ def read_data_robust(file_obj, file_name=""):
             continue
     raise ValueError(f"Impossible de décoder le fichier CSV. Encodages tentés: {', '.join(encodings)}")
 
+def get_us_state_abbrev():
+    return {
+        'Alabama': 'AL', 'Alaska': 'AK', 'Arizona': 'AZ', 'Arkansas': 'AR', 'California': 'CA',
+        'Colorado': 'CO', 'Connecticut': 'CT', 'Delaware': 'DE', 'Florida': 'FL', 'Georgia': 'GA',
+        'Hawaii': 'HI', 'Idaho': 'ID', 'Illinois': 'IL', 'Indiana': 'IN', 'Iowa': 'IA',
+        'Kansas': 'KS', 'Kentucky': 'KY', 'Louisiana': 'LA', 'Maine': 'ME', 'Maryland': 'MD',
+        'Massachusetts': 'MA', 'Michigan': 'MI', 'Minnesota': 'MN', 'Mississippi': 'MS', 'Missouri': 'MO',
+        'Montana': 'MT', 'Nebraska': 'NE', 'Nevada': 'NV', 'New Hampshire': 'NH', 'New Jersey': 'NJ',
+        'New Mexico': 'NM', 'New York': 'NY', 'North Carolina': 'NC', 'North Dakota': 'ND', 'Ohio': 'OH',
+        'Oklahoma': 'OK', 'Oregon': 'OR', 'Pennsylvania': 'PA', 'Rhode Island': 'RI', 'South Carolina': 'SC',
+        'South Dakota': 'SD', 'Tennessee': 'TN', 'Texas': 'TX', 'Utah': 'UT', 'Vermont': 'VT',
+        'Virginia': 'VA', 'Washington': 'WA', 'West Virginia': 'WV', 'Wisconsin': 'WI', 'Wyoming': 'WY',
+        'District of Columbia': 'DC'
+    }
+
+@st.cache_data(ttl=60, show_spinner=False)
 def check_api_status():
     try:
         res = requests.get(f"{API_URL}/", timeout=3)
         return res.status_code == 200 and res.json().get("model_loaded", False)
     except:
         return False
+
+@st.cache_data(ttl=300, show_spinner=False)
+def is_api_key_valid(key: str) -> list:
+    if not key: return [False, False, False]
+    try:
+        payload = {'Sales': 0, 'Discount': 0, 'Sub_Category': 'Chairs', 'Region': 'West', 'Segment': 'Consumer'}
+        res = requests.post(f"{API_URL}/predict", json=payload, headers={"X-API-KEY": key}, timeout=3)
+        return [res.status_code in [404, 502, 503, 504], res.status_code == 200, res.status_code == 500]
+    except:
+        return [True, False, False]
 
 @st.cache_data
 def load_data():
@@ -110,21 +171,46 @@ def load_data():
 df = load_data()
 api_ready = check_api_status()
 
+master_key = os.getenv("MASTER_API_KEY", "")
+using_master = False
+if master_key and is_api_key_valid(master_key)[1]:
+    current_api_key = master_key
+    using_master = True
+else:
+    current_api_key = st.session_state.get('api_key_val', '')
+api_check = is_api_key_valid(current_api_key)
+key_is_valid = api_ready and (using_master or api_check[1])
+
 # --- SIDEBAR ---
 st.sidebar.header("Configuration API")
-api_key = st.sidebar.text_input(
-    "Clé API", 
-    type="password", 
-    key="api_input", 
-    value=st.session_state['api_key_val'], 
-    on_change=save_api_key,
-    help="Appuyez sur Entrée pour valider. Obtenez-la sur http://127.0.0.1:8000/developer"
-)
+
+if using_master:
+    api_key = current_api_key
+    st.sidebar.success("✅ Application Connectée")
+elif (not key_is_valid) or ((not key_is_valid) and master_key):
+    api_key = st.sidebar.text_input(
+        "Clé API", 
+        type="password", 
+        key="api_input", 
+        value=current_api_key, 
+        on_change=save_api_key,
+        help="Appuyez sur Entrée pour valider. [Obtenir une clé API](https://kjd-dktech-superstore-api.hf.space/developer)."
+    )
+    if current_api_key or master_key:
+        if api_check[0]:
+            st.sidebar.warning("⚠️ Serveur API injoignable. Vérifiez l'URL ou votre connexion.")
+        else:
+            st.sidebar.error("❌ Clé API invalide. Veuillez réessayer ou contacter l'administrateur.")
+else:
+    api_key = current_api_key
+    st.sidebar.success("✅ Connecté à l'API")
+    if st.sidebar.button("Déconnecter / Changer la clé"):
+        st.session_state['api_key_val'] = ""
+        save_api_key()
+        st.rerun()
 
 if not api_ready:
     st.sidebar.warning("❌ L'API de prédiction ne semble pas être en ligne.")
-else:
-    st.sidebar.success("✅ Modèle API en Ligne")
 st.sidebar.markdown("---")
 
 st.sidebar.header("Filtres")
@@ -198,33 +284,12 @@ tabs_names = [
     "🕒 Historique (Logs)"
 ]
 
-def update_query_params():
-    try:
-        st.query_params["tab"] = st.session_state.app_nav_tabs
-    except AttributeError:
-        st.experimental_set_query_params(tab=st.session_state.app_nav_tabs)
-
-if "app_nav_tabs" not in st.session_state:
-    try:
-        q_tab = st.query_params.get("tab")
-    except AttributeError:
-        q_tab = st.experimental_get_query_params().get("tab", [None])[0]
-        
-    st.session_state.app_nav_tabs = q_tab if q_tab in tabs_names else tabs_names[0]
-
-selected_tab = st.radio(
-    "Navigation", 
-    tabs_names, 
-    horizontal=True, 
-    label_visibility="collapsed", 
-    key="app_nav_tabs",
-    on_change=update_query_params
-)
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(tabs_names)
 
 st.markdown("---")
 
 # --- VUES DES ONGLETS ---
-if selected_tab == tabs_names[0]:
+with tab1:
     st.subheader("Cartographie de la Rentabilité")
     if 'State' in filtered_df.columns and 'Sales' in filtered_df.columns and 'Profit' in filtered_df.columns and 'Discount' in filtered_df.columns:
         us_state_abbrev = get_us_state_abbrev()
@@ -253,7 +318,7 @@ if selected_tab == tabs_names[0]:
         fig_tf.update_layout(showlegend=False)
         st.plotly_chart(fig_tf, width='stretch')
 
-elif selected_tab == tabs_names[1]:
+with tab2:
     st.subheader("Impact des Catégories sur la Marge")
     if 'Category' in filtered_df.columns and 'Sub-Category' in filtered_df.columns:
         df_subcat = filtered_df.groupby(['Category', 'Sub-Category'], as_index=False).agg({'Sales': 'sum', 'Profit': 'sum', 'Discount': 'mean'})
@@ -268,7 +333,7 @@ elif selected_tab == tabs_names[1]:
         fig_subcat.update_layout(height=600)
         st.plotly_chart(fig_subcat, width='stretch')
 
-elif selected_tab == tabs_names[2]:
+with tab3:
     st.subheader("Analyse du Point Mort")
     if 'Discount' in filtered_df.columns and 'Sales' in filtered_df.columns and 'Profit' in filtered_df.columns:
         df_discount = filtered_df.groupby('Discount', as_index=False).agg({'Sales': 'sum', 'Profit': 'sum', 'Order ID': 'count'})
@@ -289,7 +354,7 @@ elif selected_tab == tabs_names[2]:
         )
         st.plotly_chart(fig_be, width='stretch')
 
-elif selected_tab == tabs_names[3]:
+with tab4:
     st.subheader("Valeur par Segment Client")
     if 'Segment' in filtered_df.columns and 'Customer ID' in filtered_df.columns:
         df_segment = filtered_df.groupby('Segment', as_index=False).agg({
@@ -324,7 +389,7 @@ elif selected_tab == tabs_names[3]:
             fig_seg_order.update_layout(yaxis_title="Profit / Commande ($)", showlegend=False)
             st.plotly_chart(fig_seg_order, width='stretch')
 
-elif selected_tab == tabs_names[4]:
+with tab5:
     st.subheader("Modélisation de la Rentabilité")
     
     if not api_ready:
@@ -394,7 +459,6 @@ elif selected_tab == tabs_names[4]:
                         else:
                             st.warning(f"Erreur API pour la variation ({res_batch.status_code}): {res_batch.text}")
 
-                        # Ajout à l'historique Unitaire
                         st.session_state['sim_history'].append({
                             "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             "Sales ($)": sim_sales,
@@ -404,6 +468,14 @@ elif selected_tab == tabs_names[4]:
                             "Profit Estimé ($)": round(pred_profit, 2)
                         })
                         save_history_to_disk('sim')
+                    elif res.status_code in [401, 403]:
+                        st.error("🔑 Votre clé d'accès n'est plus valide ou a été révoquée. Déconnexion requise...")
+                        st.session_state['api_key_val'] = ""
+                        clear_cookie_js('app_key')
+                        time.sleep(2)
+                        st.rerun()
+                    elif res.status_code == 429:
+                        st.warning("⏳ Limite de requêtes atteinte. Veuillez patienter un instant.")
                     else:
                         st.error(f"Accès Refusé / Erreur API ({res.status_code}): {res.text}")
                 except Exception as e:
@@ -433,7 +505,6 @@ elif selected_tab == tabs_names[4]:
                                 
                                 st.dataframe(batch_df[['Sub-Category', 'Sales', 'Discount', 'Predicted_Profit']].head())
 
-                                # Ajout à l'historique Batch
                                 st.session_state['batch_history'].append({
                                     "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                     "Fichier": uploaded_file.name,
@@ -457,6 +528,14 @@ elif selected_tab == tabs_names[4]:
                                 with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                                     batch_df.to_excel(writer, index=False, sheet_name='Prédictions')
                                 st.download_button("Télécharger Excel", data=buffer.getvalue(), file_name="predictions_batch.xlsx", mime="application/vnd.ms-excel")
+                            elif res_batch_file.status_code in [401, 403]:
+                                st.error("🔑 Votre clé d'accès n'est plus valide ou a été révoquée. Déconnexion requise...")
+                                st.session_state['api_key_val'] = ""
+                                clear_cookie_js('app_key')
+                                time.sleep(2)
+                                st.rerun()
+                            elif res_batch_file.status_code == 429:
+                                st.warning("⏳ Limite de requêtes atteinte. Veuillez patienter un instant.")
                             else:
                                 st.error(f"Erreur API ({res_batch_file.status_code}) : {res_batch_file.text}")
                         except Exception as api_err:
@@ -468,7 +547,7 @@ elif selected_tab == tabs_names[4]:
                 except Exception as e:
                     st.error(f"Erreur lors de la lecture du fichier : {e}")
 
-elif selected_tab == tabs_names[5]:
+with tab6:
     st.subheader("Historique de Session")
     
     st.markdown("### 📈 Simulations Unitaires")

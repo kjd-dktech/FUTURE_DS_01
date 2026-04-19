@@ -2,6 +2,7 @@
 pandas
 numpy
 openpyxl
+python-dotenv
 
 # --- Analyse & Notebooks ---
 nbformat
@@ -20,7 +21,6 @@ streamlit
 plotly
 xslxwriter
 huggingface_hub
-python-dotenv
 
 # --- API Microservice ---
 fastapi
@@ -29,3 +29,7 @@ pydantic
 requests
 slowapi
 jinja2
+python-multipart
+cryptography
+bcrypt
+redis
